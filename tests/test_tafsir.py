@@ -7,22 +7,31 @@ index; no live API calls and no GEMINI_API_KEY needed.
 
 import asyncio
 import time
+from typing import Any
 
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 
 from semantic_cache import get_keyed_cache
 from tafsir import (
     DEFAULT_TAFSIR_KEYS,
     MAX_AYAT_PER_REQUEST,
+    MAX_REFERENCES_PER_BATCH,
+    MAX_TOTAL_AYAT_PER_BATCH,
     TAFSIR_REGISTRY,
     AyahRef,
     FakeTafsirSource,
+    InvalidBatchRequest,
     InvalidReference,
+    TafsirApiSource,
+    TafsirBatchRequest,
     TafsirRequest,
     TafsirWork,
     VerseText,
     _normalize_surah_name,
     build_chat_tafsir_context,
+    build_tafsir_batch_response,
     build_tafsir_prompt_block,
     build_tafsir_response,
     detect_ayah_references,
@@ -32,6 +41,7 @@ from tafsir import (
     parse_reference,
     parse_tafsir_payload,
     resolve_requested_tafsirs,
+    router,
     strip_html,
     summarize_tafsir_context,
     surah_by_name,
@@ -322,6 +332,10 @@ class TestTafsirKeys:
             ("Sa'di", "saadi"),
             ("qurtubi", "qurtubi"),
             ("maariful-quran", "maarif-ul-quran"),
+            ("jalalayn", "jalalayn"),
+            ("Tafsir al-Jalalayn", "jalalayn"),
+            ("tafsir-al-jalalayn", "jalalayn"),
+            ("al-jalalain", "jalalayn"),
         ],
     )
     def test_normalize(self, raw, expected):
@@ -348,6 +362,117 @@ class TestTafsirKeys:
     def test_resolve_all_unknown_raises(self):
         with pytest.raises(InvalidReference, match="Unknown tafsir"):
             resolve_requested_tafsirs(["nonsense", "gibberish"])
+
+
+# ---------------------------------------------------------------------------
+# Tafsir API (CDN) source — Jalalayn and other works quran.com no longer carries
+# ---------------------------------------------------------------------------
+
+JALALAYN_EN_103 = {
+    "surah": 103,
+    "ayah": 1,
+    "text": "By Time! — the time in which the deeds of the children of Adam occur.",
+}
+JALALAYN_AR_103 = {"surah": 103, "ayah": 1, "text": "والعصر الدهر أو ما بعد الزوال إلى الغروب."}
+
+EDITION_EN = [
+    {
+        "id": 74,
+        "slug": "en-al-jalalayn",
+        "name": "Al-Jalalayn",
+        "author_name": "Al-Jalalayn",
+        "language_name": "english",
+    }
+]
+EDITION_AR = [
+    {
+        "id": 523,
+        "slug": "ar-tafsir-al-jalalayn",
+        "name": "Tafsir Jalalayn",
+        "author_name": "Al-Mahalli and al-Suyuti",
+        "language_name": "arabic",
+    }
+]
+
+
+class FakeCdnSource(TafsirApiSource):
+    """Offline stand-in for the jsDelivr-backed tafsir_api source."""
+
+    def __init__(self, files: dict[str, Any], editions: list[dict[str, Any]] | None = None) -> None:
+        super().__init__(base_url="http://fake-cdn")
+        self.files = dict(files)
+        if editions is not None:
+            self.files["editions.json"] = editions
+        self.calls: list[str] = []
+
+    async def _get(self, path: str) -> Any | None:
+        self.calls.append(path)
+        return self.files.get(path)
+
+
+def jalalayn_source() -> FakeCdnSource:
+    return FakeCdnSource(
+        files={"en-al-jalalayn/103/1.json": JALALAYN_EN_103, "ar-tafsir-al-jalalayn/103/1.json": JALALAYN_AR_103},
+        editions=EDITION_EN + EDITION_AR,
+    )
+
+
+class TestTafsirApiSource:
+    def test_fetch_serves_text_with_edition_attribution(self):
+        source = jalalayn_source()
+        payload = run(source.fetch_tafsir("en-al-jalalayn", "103:1"))
+        assert payload is not None
+        assert payload["text"] == JALALAYN_EN_103["text"]
+        # The name is the dataset's own edition name, not the registry's label.
+        assert payload["resource_name"] == "Al-Jalalayn"
+
+    def test_fetch_returns_none_for_coverage_gap(self):
+        """Ayat the dataset marks as uncovered 404, which degrades to unavailable."""
+        source = FakeCdnSource(files={}, editions=EDITION_EN)
+        assert run(source.fetch_tafsir("en-al-jalalayn", "2:83")) is None
+
+    def test_fetch_returns_none_for_empty_text(self):
+        source = FakeCdnSource(
+            files={"en-al-jalalayn/2/1.json": {"surah": 2, "ayah": 1, "text": ""}}, editions=EDITION_EN
+        )
+        assert run(source.fetch_tafsir("en-al-jalalayn", "2:1")) is None
+
+    def test_fetch_verse_is_not_supported(self):
+        with pytest.raises(NotImplementedError):
+            run(jalalayn_source().fetch_verse("103:1", "en"))
+
+    def test_jalalayn_parses_into_attributed_text(self):
+        work = TAFSIR_REGISTRY["jalalayn"]
+        parsed = parse_tafsir_payload(work, "en", {"text": JALALAYN_EN_103["text"], "resource_name": "Al-Jalalayn"})
+        assert parsed is not None
+        assert parsed.name == "Al-Jalalayn"
+        assert parsed.author == work.author
+        assert parsed.language == "english"
+        assert parsed.text == JALALAYN_EN_103["text"]
+
+    def test_end_to_end_retrieval_uses_cdn_source(self):
+        source = jalalayn_source()
+        available, unavailable = run(
+            fetch_tafsirs_for_ayah(AyahRef(surah=103, ayah=1), ["jalalayn"], "en", source=source)
+        )
+        assert [t.key for t in available] == ["jalalayn"]
+        assert unavailable == []
+        assert source.calls == ["en-al-jalalayn/103/1.json", "editions.json"]
+
+    def test_gap_degrades_to_unavailable_with_reason(self):
+        source = FakeCdnSource(files={}, editions=EDITION_EN)
+        available, unavailable = run(
+            fetch_tafsirs_for_ayah(AyahRef(surah=2, ayah=83), ["jalalayn"], "en", source=source)
+        )
+        assert available == []
+        assert unavailable[0].key == "jalalayn"
+        assert "No entry for 2:83" in unavailable[0].reason
+
+    def test_language_selects_the_right_edition(self):
+        source = jalalayn_source()
+        available, _ = run(fetch_tafsirs_for_ayah(AyahRef(surah=103, ayah=1), ["jalalayn"], "ar", source=source))
+        assert available[0].language == "arabic"
+        assert "ar-tafsir-al-jalalayn/103/1.json" in source.calls
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +669,95 @@ class TestBuildResponse:
             run(build_tafsir_response(TafsirRequest(reference="2:300"), make_source()))
 
 
+class TestBuildBatchResponse:
+    def test_returns_results_keyed_by_reference(self):
+        source = make_source(
+            tafsirs={
+                ("en-tafisr-ibn-kathir", "2:255"): IBN_KATHIR_103,
+                ("en-tafisr-ibn-kathir", "112:1"): IBN_KATHIR_103,
+            },
+            verses={
+                "2:255": VerseText(translation="Allah! There is no deity except Him.", translation_language="en"),
+                "112:1": VerseText(translation="Say, He is Allah, [who is] One.", translation_language="en"),
+            },
+        )
+        response = run(
+            build_tafsir_batch_response(
+                TafsirBatchRequest(
+                    references=["2:255", "103:1-3", "112:1-4"],
+                    tafsirs=["ibn-kathir"],
+                ),
+                source,
+            )
+        )
+        assert set(response.results) == {"2:255", "103:1-3", "112:1-4"}
+        assert response.errors == {}
+        assert response.results["2:255"].language == "en"
+        assert [ayah.ayah for ayah in response.results["103:1-3"].ayat] == ["103:1", "103:2", "103:3"]
+
+    def test_invalid_reference_is_returned_as_an_inline_error(self):
+        response = run(
+            build_tafsir_batch_response(
+                TafsirBatchRequest(references=["103:2", "2:300"], tafsirs=["ibn-kathir"]),
+                make_source(),
+            )
+        )
+        assert "103:2" in response.results
+        assert "2:300" in response.errors
+        assert "Al-Baqarah" in response.errors["2:300"]
+
+    def test_retrieval_failure_is_returned_as_an_inline_error(self):
+        class FailingSource(FakeTafsirSource):
+            async def fetch_verse(self, verse_key, language):
+                if verse_key == "103:2":
+                    raise RuntimeError("upstream unavailable")
+                return await super().fetch_verse(verse_key, language)
+
+        response = run(
+            build_tafsir_batch_response(
+                TafsirBatchRequest(references=["103:2", "103:3"], tafsirs=["ibn-kathir"]),
+                FailingSource(),
+            )
+        )
+        assert "103:2" not in response.results
+        assert response.errors["103:2"] == "Failed to retrieve tafsir for this reference."
+        assert "103:3" in response.results
+
+    def test_references_are_retrieved_concurrently(self):
+        class SlowSource(FakeTafsirSource):
+            async def fetch_tafsir(self, slug, verse_key):
+                await asyncio.sleep(0.05)
+                return await super().fetch_tafsir(slug, verse_key)
+
+            async def fetch_verse(self, verse_key, language):
+                await asyncio.sleep(0.05)
+                return await super().fetch_verse(verse_key, language)
+
+        source = SlowSource(
+            tafsirs={("en-tafisr-ibn-kathir", f"103:{number}"): IBN_KATHIR_103 for number in range(1, 4)},
+            verses={
+                f"103:{number}": VerseText(translation="By time,", translation_language="en") for number in range(1, 4)
+            },
+        )
+        started = time.monotonic()
+        response = run(
+            build_tafsir_batch_response(
+                TafsirBatchRequest(references=["103:1", "103:2", "103:3"], tafsirs=["ibn-kathir"]),
+                source,
+            )
+        )
+        assert time.monotonic() - started < 0.25
+        assert len(response.results) == 3
+
+    def test_total_ayah_limit_is_checked_before_fetching(self):
+        source = make_source()
+        references = [f"{number}:1-2" for number in range(1, MAX_REFERENCES_PER_BATCH)] + ["103:1-3"]
+        with pytest.raises(InvalidBatchRequest, match=str(MAX_TOTAL_AYAT_PER_BATCH)):
+            run(build_tafsir_batch_response(TafsirBatchRequest(references=references), source))
+        assert source.tafsir_calls == []
+        assert source.verse_calls == []
+
+
 # ---------------------------------------------------------------------------
 # Endpoint behaviour
 # ---------------------------------------------------------------------------
@@ -583,6 +797,66 @@ class TestEndpoint:
         assert set(DEFAULT_TAFSIR_KEYS) <= keys
         for source in sources:
             assert source.name and source.author and source.languages
+
+    def test_sources_endpoint_lists_jalalayn_with_author_and_languages(self):
+        from tafsir import list_tafsir_sources
+
+        sources = run(list_tafsir_sources())
+        jalalayn = next(s for s in sources if s.key == "jalalayn")
+        assert jalalayn.name == "Tafsir al-Jalalayn"
+        assert "al-Suyuti" in jalalayn.author
+        assert jalalayn.languages == ["ar", "en"]
+
+    def test_batch_endpoint_returns_partial_results(self):
+        from tafsir import QuranComTafsirSource, get_tafsir_batch, set_source
+
+        set_source(make_source())
+        try:
+            response = run(get_tafsir_batch(TafsirBatchRequest(references=["103:2", "2:300"], tafsirs=["ibn-kathir"])))
+        finally:
+            set_source(QuranComTafsirSource())
+        assert "103:2" in response.results
+        assert "2:300" in response.errors
+
+    def test_batch_endpoint_rejects_total_ayah_limit(self):
+        from fastapi import HTTPException
+
+        from tafsir import QuranComTafsirSource, get_tafsir_batch, set_source
+
+        set_source(make_source())
+        try:
+            with pytest.raises(HTTPException) as exc:
+                run(get_tafsir_batch(TafsirBatchRequest(references=["2:1-10", "3:1-10", "4:1"])))
+        finally:
+            set_source(QuranComTafsirSource())
+        assert exc.value.status_code == 400
+        assert str(MAX_TOTAL_AYAT_PER_BATCH) in str(exc.value.detail)
+
+    @pytest.mark.parametrize(
+        "references",
+        [
+            [],
+            [f"2:{number}" for number in range(1, MAX_REFERENCES_PER_BATCH + 2)],
+        ],
+    )
+    def test_batch_endpoint_validates_reference_count(self, references):
+        app = FastAPI()
+        app.include_router(router)
+
+        async def post_batch():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                return await client.post("/tafsir/batch", json={"references": references})
+
+        response = run(post_batch())
+        assert response.status_code == 422
+
+    def test_batch_endpoint_is_documented_in_openapi(self):
+        app = FastAPI()
+        app.include_router(router)
+        operation = app.openapi()["paths"]["/tafsir/batch"]["post"]
+        assert operation["summary"] == "Get Tafsir Batch"
+        request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
+        assert request_schema["$ref"].endswith("/TafsirBatchRequest")
 
 
 # ---------------------------------------------------------------------------
@@ -783,3 +1057,9 @@ class TestRegistry:
             for slug in work.slugs.values():
                 assert slug not in seen, f"duplicate slug {slug}"
                 seen.add(slug)
+
+    def test_jalalayn_is_registered_with_cdn_source(self):
+        work = TAFSIR_REGISTRY["jalalayn"]
+        assert work.source == "tafsir_api"
+        assert work.slug_for("en") == "en-al-jalalayn"
+        assert work.slug_for("ar") == "ar-tafsir-al-jalalayn"

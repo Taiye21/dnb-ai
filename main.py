@@ -1,16 +1,16 @@
-import os
+# ruff: noqa: E402
 import asyncio
 import json
 import logging
+import os
 import secrets
 import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
-from datetime import UTC, datetime
-from typing import Any, Optional
+from datetime import UTC, datetime, timezone
+from typing import Any
 
-import google.generativeai as genai
 from dotenv import load_dotenv
 
 # Must run before any module that reads os.getenv at import time (store,
@@ -18,9 +18,11 @@ from dotenv import load_dotenv
 # real environment variables.
 load_dotenv()
 
-from config import get_settings
+import google.generativeai as genai
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security
 from fastapi.concurrency import run_in_threadpool
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
@@ -30,12 +32,16 @@ from google.api_core.exceptions import (
     ResourceExhausted,
     ServiceUnavailable,
 )
+from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-from pydantic import BaseModel, Field, field_validator
 
 import telemetry
+from arabic_dialect import router as arabic_dialect_router
+from arabic_ocr import router as arabic_ocr_router
+from audio_hadith import router as audio_hadith_router
+from calligraphy import router as calligraphy_router
 from citations import (
     CITATION_BLOCK_CONTEXT,
     Citation,
@@ -43,7 +49,6 @@ from citations import (
     CitationStreamFilter,
     extract_citations,
 )
-from store import create_session_store, history_to_dicts, dicts_to_contents
 from confidence import (
     ConfidenceAssessment,
     ConfidenceBand,
@@ -52,6 +57,8 @@ from confidence import (
     build_signals,
     thresholds as confidence_thresholds,
 )
+from config import get_settings
+from errors import APIException
 from feedback import (
     COMMENT_MAX_CHARS,
     FEEDBACK_TAXONOMY,
@@ -67,7 +74,16 @@ from fiqh import (
     classify_fiqh,
     normalize_madhhab,
 )
-from hadith import HADITH_ADAB_CONTEXT, HadithReference, annotate as annotate_hadith, build_caution_note
+from hadith import (
+    HADITH_ADAB_CONTEXT,
+    HadithReference,
+    annotate as annotate_hadith,
+    build_caution_note,
+)
+from hadith_context import router as hadith_context_router
+from hadith_research import router as hadith_research_router
+from history import router as history_router
+from intent import accuracy_tracker as intent_accuracy_tracker, classify_intent
 from memory import ChatSummary, UserProfile, create_memory_store, render_user_context
 from memory.extraction import (
     MEMORY_EXTRACTION_ENABLED,
@@ -76,15 +92,28 @@ from memory.extraction import (
     merge_summaries,
     summarize_conversation_turns,
 )
+from misinformation_api import router as misinformation_router
+from model_router import router as model_routing_router
+from page_analysis import router as page_analysis_router
+from query_optimizer import router as query_optimizer_router
+from reasoning_chains import router as reasoning_router
+from reformulation import router as reformulation_router
 from review import enqueue_for_review, router as review_router
 from review_store import get_review_store
 from safety import InputGate, OutputCheck, SafetyPipeline, load_policy
 from semantic_cache import (
+    CHAT_CONTEXT_MAX_LENGTH,
+    CHAT_PROMPT_MAX_LENGTH,
+    CHAT_RATE_LIMIT_MAX,
+    CHAT_RATE_LIMIT_WINDOW_SECONDS,
     SEMANTIC_CACHE_ENABLED,
     embed_text,
     get_cache,
+    get_chat_exact_cache,
+    get_token_quota_tracker,
     normalize_text,
 )
+from sentiment import router as sentiment_router
 from stellar import (
     PurchaseContext,
     PurchaseInfo,
@@ -92,11 +121,18 @@ from stellar import (
     ZakatContext,
     ZakatInfo,
     build_chat_purchase_context,
+    build_chat_stellar_calculation_context,
     build_chat_zakat_context,
     redact_secret_keys,
     router as stellar_router,
 )
+from store import create_session_store, dicts_to_contents, history_to_dicts
 from study import router as study_router
+from swahili import (
+    analyze_swahili,
+    router as swahili_router,
+    swahili_response_enhancer,
+)
 from tafsir import (
     TafsirContext,
     TafsirInfo,
@@ -105,14 +141,73 @@ from tafsir import (
     summarize_tafsir_context,
     tafsir_system_context,
 )
+from video_analysis import router as video_analysis_router
+from vocabulary import router as vocabulary_router
 
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
+# --- Confidence calibration -------------------------------------------------
+CONFIDENCE_TEMPERATURE = 1.15
+CONFIDENCE_CALIBRATION_MAX_EVENTS = 10000
+_calibration_events: list[dict[str, Any]] = []
+
+
+def _calibrate_assessment(
+    assessment: ConfidenceAssessment,
+    *,
+    citation_verification: float | None,
+    evidence_quality: float,
+) -> ConfidenceAssessment:
+    """Temperature-scale the raw confidence and adjust for evidence strength."""
+    if assessment is None:
+        return assessment
+    score = assessment.score
+    calibrated = score**CONFIDENCE_TEMPERATURE if score >= 0.5 else 1 - (1 - score) ** CONFIDENCE_TEMPERATURE
+    calibrated += (float(citation_verification or 0.0) - 0.5) * 0.15
+    calibrated += (float(evidence_quality or 0.0) - 0.5) * 0.05
+    assessment.score = round(min(0.99, max(0.01, calibrated)), 4)
+    try:
+        thresholds = confidence_thresholds()
+        best = None
+        for band in ConfidenceBand:
+            try:
+                raw_limit = thresholds.get(band.value)
+                if raw_limit is None:
+                    continue
+                limit = float(raw_limit)
+            except (TypeError, ValueError):
+                continue
+            if assessment.score >= limit and (best is None or limit > best[0]):
+                best = (limit, band)
+        if best is not None:
+            assessment.band = best[1]
+    except Exception:
+        pass
+    return assessment
+
+
+def _track_calibration(assessment: ConfidenceAssessment) -> None:
+    """Record one calibration observation for /confidence/policy."""
+    if assessment is None:
+        return
+    _calibration_events.append(
+        {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "score": assessment.score,
+            "band": assessment.band.value,
+            "queued": assessment.queued,
+        }
+    )
+    if len(_calibration_events) > CONFIDENCE_CALIBRATION_MAX_EVENTS:
+        del _calibration_events[: len(_calibration_events) - CONFIDENCE_CALIBRATION_MAX_EVENTS]
+
 
 GEMINI_API_KEY = settings.gemini_api_key
 
 genai.configure(api_key=GEMINI_API_KEY)
+
+EVIDENCE_VERIFICATION_ENABLED = os.getenv("EVIDENCE_VERIFICATION_ENABLED", "true").lower() not in {"0", "false", "off"}
 
 app = FastAPI(title="DeenBridge AI API")
 
@@ -125,19 +220,16 @@ AUTH_DISABLED = os.getenv("AUTH_DISABLED", "false").lower() in {"1", "true", "ye
 if not AUTH_DISABLED and not SERVICE_API_KEY:
     if os.getenv("ENVIRONMENT", "").lower() == "production":
         raise RuntimeError(
-            "SERVICE_API_KEY must be set in production. "
-            "Set AUTH_DISABLED=true to run without authentication locally."
+            "SERVICE_API_KEY must be set in production. Set AUTH_DISABLED=true to run without authentication locally."
         )
-    logger.warning(
-        "SERVICE_API_KEY is not set; authenticated endpoints will reject all requests."
-    )
+    logger.warning("SERVICE_API_KEY is not set; authenticated endpoints will reject all requests.")
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 async def verify_api_key(
     request: Request,
-    api_key: Optional[str] = Security(api_key_header),
+    api_key: str | None = Security(api_key_header),
 ) -> str:
     """Dependency that enforces X-API-Key on protected routes.
 
@@ -146,7 +238,14 @@ async def verify_api_key(
     if AUTH_DISABLED:
         return ""
     if not api_key or not secrets.compare_digest(api_key, SERVICE_API_KEY):
-        raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key")
+        raise APIException(
+            status_code=401,
+            detail="Missing or invalid X-API-Key",
+            hint=(
+                "Provide a valid service API key in the 'X-API-Key' header (e.g., 'X-API-Key: <your-key>'). "
+                "For local testing without authentication, set environment variable AUTH_DISABLED=true."
+            ),
+        )
     return api_key
 
 
@@ -177,18 +276,117 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONRe
     retry_after = getattr(exc, "retry_after", 60)
     return JSONResponse(
         status_code=429,
-        content={"detail": f"Rate limit exceeded: {exc.detail}"},
+        content={
+            "detail": f"Rate limit exceeded: {exc.detail}",
+            "hint": f"Too many requests sent. Please wait {retry_after} seconds before retrying.",
+        },
         headers={"Retry-After": str(retry_after)},
     )
 
-# Stellar integration: read-only zakat/balance features on the network
-# the rest of the Deen Bridge platform settles on
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    headers = getattr(exc, "headers", None) or {}
+    hint = getattr(exc, "hint", None)
+
+    if isinstance(exc.detail, dict):
+        content = dict(exc.detail)
+        if hint and "hint" not in content:
+            content["hint"] = hint
+    else:
+        content = {"detail": exc.detail}
+        if hint:
+            content["hint"] = hint
+
+    return JSONResponse(status_code=exc.status_code, content=jsonable_encoder(content), headers=headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    errors = exc.errors()
+    hints = []
+    for err in errors:
+        loc = " -> ".join(str(part) for part in err.get("loc", []) if part != "body")
+        msg = err.get("msg", "Invalid value")
+        if loc:
+            hints.append(f"Field '{loc}': {msg}")
+        else:
+            hints.append(msg)
+    hint_str = "; ".join(hints) if hints else "Please check request parameters and schema."
+    content = {
+        "detail": errors,
+        "hint": f"Validation failed ({hint_str}). Please provide valid input according to the API schema.",
+    }
+    return JSONResponse(
+        status_code=422,
+        content=jsonable_encoder(content),
+    )
+
+
+# Stellar integration: read-only wallet and payment lookups plus deterministic
+# USDC arithmetic on the network the rest of Deen Bridge settles on.
 app.include_router(stellar_router)
+app.include_router(reasoning_router)
 app.include_router(study_router)
+# Religious sentiment analysis: reads the emotional/spiritual tone of a question
+app.include_router(sentiment_router)
 # Tafsir: grounded, attributed ayah explanations from named classical works
 app.include_router(tafsir_router)
+# Page analysis: layout understanding of scanned Islamic book pages
+app.include_router(page_analysis_router)
+# Calligraphy: deterministic style estimation for Arabic calligraphic hands
+app.include_router(calligraphy_router)
 # Scholar review: the human end of the abstention loop
 app.include_router(review_router)
+# Question reformulation: deterministic quality assessment + rewrite suggestions
+app.include_router(reformulation_router)
+# Contextual hadith interpretation: sharh, asbab al-wurud, and synthesis
+app.include_router(hadith_context_router)
+# Audio Hadith: verify transcribed narrations against an authenticated corpus
+app.include_router(audio_hadith_router)
+# Hadith Research: retrieval, isnad analysis, rijal cross-referencing, grading
+# justification, and variant alignment across ten major collections
+app.include_router(hadith_research_router)
+# Database query optimization: static anti-pattern analysis + runtime profiling
+app.include_router(query_optimizer_router)
+# Historical context: asbab al-nuzul, hadith circumstances, and fiqh development
+app.include_router(history_router)
+# Model routing: pick the optimal model per query by complexity, latency and cost
+app.include_router(model_routing_router)
+# Arabic OCR: manuscript digitization with calligraphy detection and diacritic preservation
+app.include_router(arabic_ocr_router)
+# Quranic vocabulary analysis: root extraction, frequency stats, search, and verse examples
+app.include_router(vocabulary_router)
+# Swahili language processing: Islamic terminology, loanword morphology, and East African context
+app.include_router(swahili_router)
+app.include_router(video_analysis_router)
+# Arabic dialect support: Egyptian/Gulf/Levantine identification, MSA
+# normalization and dialectal terminology lexicon (#136)
+app.include_router(arabic_dialect_router)
+# Religious misinformation flagging: detection, correction, and blocking of misinformation
+app.include_router(misinformation_router)
+
+from adhkar import corpus as adhkar_corpus
+
+
+class AdhkarRecommendRequest(BaseModel):
+    category: str | None = None
+    query: str | None = None
+
+
+@app.post("/adhkar/recommend")
+async def recommend_adhkar(body: AdhkarRecommendRequest) -> dict[str, Any]:
+    matches = adhkar_corpus.search(category=body.category, query=body.query)
+    message = (
+        f"Found {len(matches)} authenticated supplication(s) matching your request."
+        if matches
+        else "No authenticated supplication found matching your request."
+    )
+    return {
+        "matches": matches,
+        "message": message,
+    }
+
 
 # Configure CORS
 app.add_middleware(
@@ -211,10 +409,30 @@ class CitationVerificationResult(BaseModel):
     reason: str | None = None
 
 
+class EvidenceClaim(BaseModel):
+    claim: str
+    evidence: list[str] = Field(default_factory=list)
+    source_type: str | None = None
+    verification_status: str = "unverified"
+    confidence: float | None = None
+    reason: str | None = None
+    alternative_evidence: list[str] = Field(default_factory=list)
+
+
+class EvidenceVerificationResult(BaseModel):
+    claims: list[EvidenceClaim] = Field(default_factory=list)
+    overall_score: float = 0.0
+    audit_trail: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class EvidenceVerifyRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=30000)
+
+
 class ChatRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(..., max_length=CHAT_PROMPT_MAX_LENGTH)
     chat_id: str | None = None
-    context: str | None = None  # Additional context for specific queries
+    context: str | None = Field(None, max_length=CHAT_CONTEXT_MAX_LENGTH)  # Additional context for specific queries
     madhhab: str | None = None  # User's madhhab: hanafi, maliki, shafii, hanbali
     language: str | None = None  # BCP-47 response language (ar, en, ur, etc.); auto-detect when omitted
     user_id: str | None = Field(default=None, max_length=128)  # Opaque user identifier for personalization
@@ -254,6 +472,8 @@ class ChatResponse(BaseModel):
     # Structured references parsed out of the answer (#15). Empty when the
     # answer cited nothing, or when nothing it cited could be validated.
     citations: list[Citation] = []
+    # Evidence verification agent audit (#evidence-verification).
+    evidence_verification: EvidenceVerificationResult | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -323,6 +543,7 @@ safety_pipeline = SafetyPipeline(InputGate(safety_policy, classify_for_safety), 
 
 # Semantic response cache
 semantic_cache = get_cache()
+token_quota_tracker = get_token_quota_tracker()
 
 # Durable queue for low-confidence religious answers awaiting a scholar
 review_store = get_review_store()
@@ -412,7 +633,11 @@ answer_snapshots: "OrderedDict[tuple, dict[str, str]]" = OrderedDict()
 # Only honor X-Forwarded-For when the deployment actually sits behind a proxy we
 # control; otherwise any client can rotate the header to mint a fresh rate-limit
 # bucket on every request and defeat the only control on the write endpoint.
-TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").lower() in {"1", "true", "yes"}
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 
 def _record_answer(chat_id: str, prompt: str, answer: str) -> str:
@@ -444,14 +669,19 @@ _admin_header = APIKeyHeader(name="X-Admin-Token", auto_error=False)
 async def require_admin(token: str | None = Depends(_admin_header)) -> None:
     """Gate admin endpoints on ADMIN_TOKEN; closed by default when unset."""
     if not ADMIN_TOKEN:
-        raise HTTPException(
+        raise APIException(
             status_code=503,
             detail="ADMIN_TOKEN is not configured on this server.",
+            hint="Set the ADMIN_TOKEN environment variable in server configuration to enable admin management routes.",
         )
     # Compare as bytes: secrets.compare_digest raises on non-ASCII str, which
     # would turn a crafted header into a 500 instead of a clean 403.
     if not token or not secrets.compare_digest(token.encode("utf-8"), ADMIN_TOKEN.encode("utf-8")):
-        raise HTTPException(status_code=403, detail="Invalid or missing admin token.")
+        raise APIException(
+            status_code=403,
+            detail="Invalid or missing admin token.",
+            hint="Include the configured admin secret in the 'X-Admin-Token' request header (e.g., 'X-Admin-Token: <admin_token>').",
+        )
 
 
 ISLAMIC_CONTEXT = (
@@ -489,6 +719,9 @@ LANGUAGE_INSTRUCTIONS = (
     "when writing in Latin-script languages.\n"
     "- When responding in Arabic, use classical Quranic Arabic for quotations "
     "and modern standard Arabic (فصحى) for the rest of the response.\n"
+    "- When responding in Swahili (Kiswahili), use standard respectful Swahili (Kiswahili Sanifu) "
+    "with proper Islamic honorifics (k.m. 'Mwenyezi Mungu (Subhanahu wa Ta'ala)', 'Mtume Muhammad (Swalla Allahu Alayhi wa Sallam / ﷺ)', "
+    "'Maswahaba (Radhi Allahu Anhum)') and standard Swahili Islamic terminology (Swala, Udhu, Saumu, Zaka, Hija, Halali, Haramu, Kadhi).\n"
     "- Do NOT mix languages within a single response unless the user explicitly code-switches.\n"
 )
 
@@ -635,8 +868,86 @@ async def run_strict_corrective_loop(
     return safe_text or original_text
 
 
+def _citation_to_dict(item: Any) -> dict[str, Any]:
+    if hasattr(item, "model_dump"):
+        return item.model_dump()
+    if hasattr(item, "dict"):
+        return item.dict()
+    return {}
+
+
+def _evidence_label(d: dict[str, Any]) -> str:
+    if d.get("source") == "quran" and d.get("surah") is not None:
+        return f"Quran {d['surah']}:{d.get('ayah', '')}"
+    if d.get("collection"):
+        return f"{d['collection']} {d.get('number', '')}".strip()
+    return str(d.get("source") or "cited source")
+
+
+def verify_evidence_claims(
+    response_text: str,
+    citation_extraction: CitationExtraction,
+    hadith_refs: list[HadithReference],
+) -> EvidenceVerificationResult:
+    """Deterministic claim-evidence audit using already-verified citations."""
+    result = EvidenceVerificationResult()
+    claims = [s.strip() for s in response_text.replace("\n", " ").split(".") if len(s.strip()) >= 25]
+    evidence: list[tuple[str, str, bool]] = []
+
+    for c in citation_extraction.citations:
+        d = _citation_to_dict(c)
+        label = _evidence_label(d)
+        status = str(d.get("status") or d.get("verification") or "unverified")
+        evidence.append((label, status, status in {"verified", "authentic", "sahih", "hasan", "mutawatir"}))
+
+    for h in hadith_refs:
+        d = _citation_to_dict(h)
+        label = _evidence_label(d)
+        grade = str(d.get("grade") or d.get("authenticity") or d.get("status") or "unverified").lower()
+        evidence.append((label, grade, grade not in {"daif", "weak", "munkar", "fabricated", "mawdu", "unverified"}))
+
+    for claim in claims:
+        matched = [e for e in evidence if e[0].lower() in claim.lower()]
+        if not matched and len(claims) == 1 and len(evidence) == 1:
+            matched = evidence[:]
+
+        if not matched:
+            result.claims.append(
+                EvidenceClaim(
+                    claim=claim,
+                    verification_status="unsupported",
+                    confidence=0.1,
+                    reason="No verifiable citation is present for this claim.",
+                    alternative_evidence=["Provide a precise Quranic/Hadith citation for this claim."],
+                )
+            )
+            result.audit_trail.append({"claim": claim, "status": "unsupported"})
+            continue
+
+        supported = any(e[2] for e in matched)
+        status = "supported" if supported else "weak"
+        result.claims.append(
+            EvidenceClaim(
+                claim=claim,
+                evidence=[e[0] for e in matched],
+                verification_status=status,
+                confidence=0.9 if supported else 0.4,
+                reason="Evidence linked and verified." if supported else "Evidence cited but could not be verified.",
+            )
+        )
+        result.audit_trail.append({"claim": claim, "evidence": [e[0] for e in matched], "status": status})
+
+    result.overall_score = (
+        sum(1 for c in result.claims if c.verification_status == "supported") / len(result.claims)
+        if result.claims
+        else 0.0
+    )
+    return result
+
+
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest, http_request: Request, fastapi_response: Response) -> ChatResponse:
+@limiter.limit(f"{CHAT_RATE_LIMIT_MAX}/{CHAT_RATE_LIMIT_WINDOW_SECONDS} seconds")
+async def chat(body: ChatRequest, request: Request, fastapi_response: Response) -> ChatResponse:
     trace = telemetry.Trace()
     _ctx_token = telemetry.current_trace.set(trace)
     _handler_start = time.perf_counter()
@@ -653,48 +964,82 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
         telemetry.registry.record_request(handler_ms, error=False)
 
     try:
-        chat_id = request.chat_id or str(uuid.uuid4())
+        chat_id = body.chat_id or str(uuid.uuid4())
         is_new_chat = chat_id not in active_chats
-        is_bypass = http_request.headers.get("X-Cache-Bypass") == "1"
+        is_bypass = request.headers.get("X-Cache-Bypass") == "1"
 
         # A user who pastes a Stellar secret key must not have it forwarded to
         # the model provider or written into stored history. Everything
         # downstream works from the redacted text; the zakat layer separately
         # detects that one was present and warns the user.
-        prompt = redact_secret_keys(request.prompt)
-        extra_context = redact_secret_keys(request.context)
+        prompt = redact_secret_keys(body.prompt)
+        extra_context = redact_secret_keys(body.context)
         logger.info(f"Received chat request: {prompt[:100]}...")
 
         # --- Fiqh/intent classification & madhhab ---
         with trace.span("classification"):
-            madhhab = normalize_madhhab(request.madhhab)
+            madhhab = normalize_madhhab(body.madhhab)
             is_fiqh = classify_fiqh(prompt)
             fiqh_info = FiqhInfo(is_fiqh_question=is_fiqh, madhhab_requested=madhhab)
-            effective_language = normalize_language(request.language)
+            effective_language = normalize_language(body.language)
+
+            # Hierarchical multi-label intent classification (#203). Offline and
+            # deterministic; recorded for accuracy tracking and structured logs.
+            intent = classify_intent(prompt)
+            intent_accuracy_tracker.record_prediction(intent)
+            logger.info("intent=%s", {"chat_id": chat_id, **intent.model_dump()})
+
+            # --- Swahili analysis ---
+            is_swahili = effective_language == "sw"
+            swahili_analysis = None
+            if is_swahili or any(
+                w in prompt.lower()
+                for w in [
+                    "je,",
+                    "habari",
+                    "swala",
+                    "udhu",
+                    "saumu",
+                    "zaka",
+                    "hija",
+                    "kadhi",
+                    "bakwata",
+                    "maulidi",
+                    "kufunga",
+                ]
+            ):
+                swahili_analysis = analyze_swahili(prompt)
+                if not is_swahili and len(swahili_analysis.detected_terms) >= 2:
+                    is_swahili = True
+                    effective_language = "sw"
 
         # --- Tafsir and zakat retrieval (grouped as one telemetry stage) ---
         with trace.span("retrieval"):
             # Tafsir detection is offline (regex + the bundled surah index),
             # so a non-tafsir prompt costs nothing.
-            tafsir_context = await tafsir_retriever(prompt, request.language or DEFAULT_TAFSIR_LANGUAGE)
+            tafsir_context = await tafsir_retriever(prompt, body.language or DEFAULT_TAFSIR_LANGUAGE)
             tafsir_info = summarize_tafsir_context(tafsir_context) if tafsir_context else None
 
             # Zakat detection is offline (keywords plus a key-shaped match), so
             # an ordinary prompt never touches Horizon or the gold-price API.
-            zakat_context = await zakat_retriever(request.prompt, request.context)
+            zakat_context = await zakat_retriever(body.prompt, body.context)
             zakat_info = zakat_context.info if zakat_context else None
 
             # Purchase detection is offline (keywords). History comes from an
             # inline summary or a best-effort JWT fetch — never other users'.
-            purchase_context = await purchase_retriever(request.prompt, request.transactions, request.auth_token)
+            purchase_context = await purchase_retriever(body.prompt, body.transactions, body.auth_token)
             purchase_info = purchase_context.info if purchase_context else None
+            stellar_calculation_context = build_chat_stellar_calculation_context(prompt)
 
         # --- Memory lookup ---
         profile: UserProfile | None = None
         summary: ChatSummary | None = None
-        if request.user_id:
-            profile = await memory_store.get_profile(request.user_id)
-            summary = await memory_store.get_chat_summary(f"{request.user_id}:{chat_id}")
+        if body.user_id:
+            profile = await memory_store.get_profile(body.user_id)
+            summary = await memory_store.get_chat_summary(f"{body.user_id}:{chat_id}")
+
+        # Determine cache scope: public for anonymous, user:{user_id} for authenticated
+        cache_scope = "public" if body.user_id is None else f"user:{body.user_id}"
 
         # Neither a tafsir-grounded answer nor a zakat/purchase answer goes
         # through the semantic response cache: the first is built from retrieved
@@ -702,22 +1047,57 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
         # user's real financial data, which must never be replayed to anyone else.
         is_cacheable = (
             is_new_chat
-            and request.context is None
+            and body.context is None
             and tafsir_context is None
             and zakat_context is None
             and purchase_context is None
-            and request.user_id is None
+            and stellar_calculation_context is None
             and SEMANTIC_CACHE_ENABLED
         )
 
-        # --- Semantic cache lookup ---
+        # --- Two-tier cache lookup: exact-match first, then semantic ---
+        exact_cache = get_chat_exact_cache()
         embedding: Any = None
         normalized: str | None = None
+
         if is_cacheable and not is_bypass:
+            # Exact-match cache lookup (tier 1)
+            exact_key = f"{cache_scope}:{normalize_text(prompt)}"
+            exact_cached = exact_cache.get(exact_key)
+            if exact_cached is not None:
+                fastapi_response.headers["X-Cache-Tier"] = "exact"
+                fastapi_response.headers["X-Semantic-Cache"] = "hit"
+                model = genai.GenerativeModel(
+                    telemetry.GEMINI_MODEL,
+                    safety_settings=get_safety_settings(),
+                )
+                chat_session = model.start_chat(
+                    history=[
+                        {"role": "user", "parts": [{"text": prompt}]},
+                        {"role": "model", "parts": [{"text": exact_cached["response"]}]},
+                    ]
+                )
+                active_chats[chat_id] = chat_session
+                logger.info("Exact cache HIT for prompt: %s", prompt[:80])
+                cached_message_id = _record_answer(chat_id, prompt, exact_cached["response"])
+                _finalize()
+                _succeeded = True
+                return ChatResponse(
+                    response=exact_cached["response"],
+                    chat_id=chat_id,
+                    message_id=cached_message_id,
+                    history=exact_cached["history"],
+                    fiqh=fiqh_info,
+                    hadith_references=annotate_hadith(exact_cached["response"]),
+                    language=effective_language,
+                )
+
+            # Semantic cache lookup (tier 2)
             normalized = normalize_text(prompt)
             embedding = embed_text(normalized)
-            cached = semantic_cache.get(embedding)
+            cached = semantic_cache.get(embedding, scope=cache_scope)
             if cached is not None:
+                fastapi_response.headers["X-Cache-Tier"] = "semantic"
                 fastapi_response.headers["X-Semantic-Cache"] = "hit"
                 model = genai.GenerativeModel(
                     telemetry.GEMINI_MODEL,
@@ -746,6 +1126,24 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
         elif is_bypass:
             semantic_cache.bypasses += 1
 
+        # --- Token quota enforcement ---
+        # Check quota before making any LLM call (cache miss path)
+        quota_key = body.user_id if body.user_id else _rate_limit_key(request)
+        # Estimate token count for quota check (conservative estimate)
+        estimated_tokens = len(prompt.split()) + len(body.context.split()) if body.context else len(prompt.split())
+        # Use a conservative multiplier for system context and response
+        estimated_tokens = int(estimated_tokens * 3)  # Account for system prompt and response
+
+        quota_allowed, retry_after = token_quota_tracker.is_allowed(quota_key, estimated_tokens)
+        if not quota_allowed:
+            logger.warning("Token quota exceeded for key %s: retry_after=%d", quota_key, retry_after)
+            raise APIException(
+                status_code=429,
+                detail="Token quota exceeded. Please try again later.",
+                hint=f"Hourly token quota limit reached. Please wait {retry_after} seconds before sending further messages, or reduce message length.",
+                headers={"Retry-After": str(retry_after)},
+            )
+
         # --- Normal flow (cache miss / bypass / not cacheable) ---
         async def generate(safety_prompt: str) -> str:
             if chat_id not in active_chats:
@@ -767,6 +1165,14 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
                 system_context += zakat_context.prompt_block
             if purchase_context is not None:
                 system_context += purchase_context.prompt_block
+            if stellar_calculation_context is not None:
+                system_context += "\n\n" + stellar_calculation_context
+            if is_swahili and swahili_analysis:
+                sw_enhancement = swahili_response_enhancer.build_prompt_enhancement(safety_prompt)
+                if sw_enhancement.cultural_notes:
+                    system_context += "\n\nMuktadha wa Afrika Mashariki (East African Context):\n" + "\n".join(
+                        f"- {note}" for note in sw_enhancement.cultural_notes
+                    )
             memory_block = render_user_context(profile, summary)
             if memory_block:
                 system_context += f"\n\n{memory_block}"
@@ -788,7 +1194,11 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
             )
             text = extract_text_safely(response)
             if not text:
-                raise HTTPException(status_code=500, detail="Empty response from AI model")
+                raise APIException(
+                    status_code=500,
+                    detail="Empty response from AI model",
+                    hint="The upstream AI model returned an empty response. Try rephrasing your prompt or asking again in a few moments.",
+                )
             return text
 
         enabled = os.getenv("SAFETY_PIPELINE_ENABLED", "true").lower() not in {"0", "false", "off"}
@@ -826,10 +1236,7 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
 
                 if message.role == "user":
                     content = _strip_system_context(content)
-                history.append(Message(
-                    role="user" if message.role == "user" else "model",
-                    content=content
-                ))
+                history.append(Message(role="user" if message.role == "user" else "model", content=content))
             except Exception as e:
                 logger.warning(f"Error processing message in history: {str(e)}")
                 continue
@@ -847,6 +1254,13 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
         # Baked into response_text *before* the cache write so a cached hit
         # replays the same caution the user originally saw.
         hadith_refs = annotate_hadith(response_text)
+        # --- Evidence verification agent ---
+        evidence_verification = None
+        if EVIDENCE_VERIFICATION_ENABLED:
+            try:
+                evidence_verification = verify_evidence_claims(response_text, citation_extraction, hadith_refs)
+            except Exception as exc:  # noqa: BLE001 - verification is best-effort
+                logger.warning("Evidence verification failed; continuing without it: %s", exc)
         caution = build_caution_note(response_text, hadith_refs)
         if caution:
             response_text = f"{response_text.rstrip()}\n\n{caution}"
@@ -868,6 +1282,16 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
             citation_verification=citation_extraction.score,
         )
         assessment = assess(signals)
+        assessment = _calibrate_assessment(
+            assessment,
+            citation_verification=citation_extraction.score,
+            evidence_quality=1.0 if hadith_refs else (0.6 if citation_extraction.citations else 0.4),
+        )
+        _track_calibration(assessment)
+        if assessment.band is ConfidenceBand.CONFIDENT:
+            assessment.queued = False
+        elif not assessment.queued:
+            assessment.queued = True
         answer_before_policy = response_text
 
         if assessment.queued:
@@ -899,19 +1323,45 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
             },
         )
 
-        # --- Semantic cache write ---
+        # --- Two-tier cache write ---
         # Only confident answers are cached. Replaying an abstention, or a
         # hedged answer whose warning would outlive the doubt that caused it,
         # would spread one turn's uncertainty to every later asker.
         is_cacheable = is_cacheable and assessment.band is ConfidenceBand.CONFIDENT
         if is_cacheable and (safety_result is None or safety_result.generator_called):
+            # Get token count from telemetry for savings tracking
+            totals = trace.request_totals()
+            token_count = totals.get("total_tokens", 0)
+
             if embedding is None:
                 normalized = normalize_text(prompt)
                 embedding = embed_text(normalized)
-            semantic_cache.put(embedding, response_text, chat_id, history)
-            logger.info("Semantic cache WRITE for prompt: %s", prompt[:80])
 
+            # Write to exact-match cache (tier 1)
+            exact_key = f"{cache_scope}:{normalized}"
+            exact_cache.put(
+                exact_key,
+                {"response": response_text, "history": history},
+                token_count=token_count,
+            )
+
+            # Write to semantic cache (tier 2)
+            semantic_cache.put(
+                embedding,
+                response_text,
+                chat_id,
+                history,
+                scope=cache_scope,
+                token_count=token_count,
+            )
+            logger.info("Two-tier cache WRITE for prompt: %s (scope: %s)", prompt[:80], cache_scope)
+
+        fastapi_response.headers["X-Cache-Tier"] = "miss"
         fastapi_response.headers["X-Semantic-Cache"] = "bypass" if is_bypass else "miss"
+        if swahili_analysis:
+            fastapi_response.headers["X-Swahili-Dialect"] = swahili_analysis.dialect.primary_dialect.value
+            fastapi_response.headers["X-Swahili-Terms-Detected"] = str(len(swahili_analysis.detected_terms))
+            fastapi_response.headers["X-Swahili-Code-Switching"] = swahili_analysis.code_switch.switch_type.value
 
         # Assign this answer a stable id and snapshot the displayed text, so a
         # later /feedback call can reference exactly this turn and store what
@@ -943,21 +1393,20 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
             purchases=purchase_info,
             language=effective_language,
             citations=citation_extraction.citations,
+            evidence_verification=evidence_verification,
         )
         _finalize()
         _succeeded = True
 
         # --- Persist chat history ---
-        asyncio.create_task(
-            _persist_chat_history(chat_id, request.user_id, chat_session)
-        )
+        asyncio.create_task(_persist_chat_history(chat_id, body.user_id, chat_session))
 
         # --- Background memory extraction and summarization ---
         # Runs as fire-and-forget tasks after the response is sent.
-        if request.user_id and request.remember and MEMORY_EXTRACTION_ENABLED:
+        if body.user_id and body.remember and MEMORY_EXTRACTION_ENABLED:
             asyncio.create_task(
                 _extract_and_update_memory(
-                    request.user_id,
+                    body.user_id,
                     prompt,
                     response_text,
                     chat_id,
@@ -965,52 +1414,56 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
                     memory_store,
                 )
             )
-            logger.info("Memory extraction scheduled for user %s", request.user_id[:8])
+            logger.info("Memory extraction scheduled for user %s", body.user_id[:8])
 
         # --- Summary eviction ---
         # After enough turns accumulate, summarize old history and persist.
-        if request.user_id and request.remember and MEMORY_EXTRACTION_ENABLED:
+        if body.user_id and body.remember and MEMORY_EXTRACTION_ENABLED:
             chat_session = active_chats.get(chat_id)
             if chat_session and hasattr(chat_session, "history") and chat_session.history:
                 if len(chat_session.history) >= MAX_CHAT_HISTORY_TURNS:
                     asyncio.create_task(
                         _summarize_history(
-                            f"{request.user_id}:{chat_id}",
+                            f"{body.user_id}:{chat_id}",
                             chat_session.history,
                             summary,
                             memory_store,
                         )
                     )
-                    logger.info("History summarization triggered for %s", request.user_id[:8])
+                    logger.info("History summarization triggered for %s", body.user_id[:8])
 
         return response_obj
 
     except ResourceExhausted as exc:
         logger.warning("Gemini rate limit exceeded for chat %s: %s", chat_id, exc)
-        raise HTTPException(
+        raise APIException(
             status_code=429,
             detail="Rate limit exceeded. Please try again later.",
+            hint="Upstream Gemini API rate limit reached. Please wait 10-30 seconds before retrying.",
             headers={"X-Trace-Id": trace.trace_id},
         ) from exc
     except InvalidArgument as exc:
         logger.warning("Invalid argument for Gemini call in chat %s: %s", chat_id, exc)
-        raise HTTPException(
+        raise APIException(
             status_code=400,
             detail="Invalid request parameters.",
+            hint="Verify request fields (e.g., prompt length must be 1-10000 characters, context must be <= 5000 characters).",
             headers={"X-Trace-Id": trace.trace_id},
         ) from exc
     except (TimeoutError, DeadlineExceeded) as exc:
         logger.warning("Gemini API call timed out for chat %s: %s", chat_id, exc)
-        raise HTTPException(
+        raise APIException(
             status_code=504,
             detail="AI service timed out.",
+            hint="The AI provider did not respond within the deadline. Retry in a few seconds or try a shorter prompt.",
             headers={"X-Trace-Id": trace.trace_id},
         ) from exc
     except ServiceUnavailable as exc:
         logger.warning("Gemini service unavailable for chat %s: %s", chat_id, exc)
-        raise HTTPException(
+        raise APIException(
             status_code=503,
             detail="AI service temporarily unavailable.",
+            hint="The AI service is temporarily experiencing high load or provider downtime. Please retry in 30-60 seconds.",
             headers={"X-Trace-Id": trace.trace_id},
         ) from exc
     except HTTPException as exc:
@@ -1020,9 +1473,10 @@ async def chat(request: ChatRequest, http_request: Request, fastapi_response: Re
         raise
     except Exception as exc:
         logger.exception("Unexpected error in /chat handler for session %s: %s", chat_id, exc)
-        raise HTTPException(
+        raise APIException(
             status_code=500,
             detail="AI service error",
+            hint="An unexpected server error occurred while generating the answer. Please retry your request or contact support if the issue persists.",
             headers={"X-Trace-Id": trace.trace_id},
         ) from exc
     finally:
@@ -1077,7 +1531,8 @@ async def _summarize_history(
 
 
 @app.post("/chat/stream")
-async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingResponse:
+@limiter.limit(f"{CHAT_RATE_LIMIT_MAX}/{CHAT_RATE_LIMIT_WINDOW_SECONDS} seconds")
+async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
     """Streaming chat endpoint using Server-Sent Events (SSE).
 
     Returns incremental ``data:`` events carrying text deltas as JSON
@@ -1098,24 +1553,31 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
     _handler_start = time.perf_counter()
 
     try:
-        chat_id = request.chat_id or str(uuid.uuid4())
-        prompt = redact_secret_keys(request.prompt)
-        extra_context = redact_secret_keys(request.context)
+        chat_id = body.chat_id or str(uuid.uuid4())
+        prompt = redact_secret_keys(body.prompt)
+        extra_context = redact_secret_keys(body.context)
         logger.info("Received streaming chat request: %s...", prompt[:100])
 
         # --- Fiqh/intent classification & madhhab ---
         with trace.span("classification"):
-            madhhab = normalize_madhhab(request.madhhab)
+            madhhab = normalize_madhhab(body.madhhab)
             is_fiqh = classify_fiqh(prompt)
             fiqh_info = FiqhInfo(is_fiqh_question=is_fiqh, madhhab_requested=madhhab)
-            effective_language = normalize_language(request.language)
+            effective_language = normalize_language(body.language)
+
+            # Hierarchical multi-label intent classification (#203). Offline and
+            # deterministic; recorded for accuracy tracking and structured logs.
+            intent = classify_intent(prompt)
+            intent_accuracy_tracker.record_prediction(intent)
+            logger.info("intent=%s", {"chat_id": chat_id, **intent.model_dump()})
 
         # --- Tafsir and zakat retrieval ---
         with trace.span("retrieval"):
-            tafsir_context = await tafsir_retriever(prompt, request.language or DEFAULT_TAFSIR_LANGUAGE)
+            tafsir_context = await tafsir_retriever(prompt, body.language or DEFAULT_TAFSIR_LANGUAGE)
             tafsir_info = summarize_tafsir_context(tafsir_context) if tafsir_context else None
-            zakat_context = await zakat_retriever(request.prompt, request.context)
+            zakat_context = await zakat_retriever(body.prompt, body.context)
             zakat_info = zakat_context.info if zakat_context else None
+            stellar_calculation_context = build_chat_stellar_calculation_context(prompt)
 
         combined_text: str = ""  # accumulated full response for post-processing
         chat_session = None
@@ -1123,7 +1585,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
         safety_enabled = os.getenv("SAFETY_PIPELINE_ENABLED", "true").lower() not in {"0", "false", "off"}
 
         # --- Purchase history ---
-        purchase_context = await purchase_retriever(request.prompt, request.transactions, request.auth_token)
+        purchase_context = await purchase_retriever(body.prompt, body.transactions, body.auth_token)
 
         async def event_generator() -> AsyncGenerator[str, None]:
             """SSE generator: metadata → content deltas → done/error."""
@@ -1193,6 +1655,8 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                     system_context += zakat_context.prompt_block
                 if purchase_context is not None:
                     system_context += purchase_context.prompt_block
+                if stellar_calculation_context is not None:
+                    system_context += "\n\n" + stellar_calculation_context
 
                 ctx = f"Additional context: {extra_context}\n\n" if extra_context else ""
                 full_prompt = f"{system_context}\n{ctx}User question: {generation_prompt}"
@@ -1263,6 +1727,12 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
 
                 # --- Hadith authenticity grading ---
                 hadith_refs = annotate_hadith(combined_text)
+                evidence_verification = None
+                if EVIDENCE_VERIFICATION_ENABLED:
+                    try:
+                        evidence_verification = verify_evidence_claims(combined_text, citation_extraction, hadith_refs)
+                    except Exception as exc:  # noqa: BLE001 - verification is best-effort
+                        logger.warning("Streaming evidence verification failed: %s", exc)
                 caution = build_caution_note(combined_text, hadith_refs)
                 if caution:
                     combined_text = f"{combined_text.rstrip()}\n\n{caution}"
@@ -1275,6 +1745,16 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                     citation_verification=citation_extraction.score,
                 )
                 assessment = assess(signals)
+                assessment = _calibrate_assessment(
+                    assessment,
+                    citation_verification=citation_extraction.score,
+                    evidence_quality=1.0 if hadith_refs else (0.6 if citation_extraction.citations else 0.4),
+                )
+                _track_calibration(assessment)
+                if assessment.band is ConfidenceBand.CONFIDENT:
+                    assessment.queued = False
+                elif not assessment.queued:
+                    assessment.queued = True
 
                 if assessment.queued:
                     try:
@@ -1341,6 +1821,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                         "tafsir": tafsir_info.model_dump() if tafsir_info else None,
                         "zakat": zakat_info.model_dump() if zakat_info else None,
                         "citations": [c.model_dump() for c in citation_extraction.citations],
+                        "evidence_verification": evidence_verification.model_dump() if evidence_verification else None,
                     },
                     ensure_ascii=False,
                 )
@@ -1352,7 +1833,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 # Awaited (not fire-and-forget) so a client that immediately
                 # reloads the chat list sees this turn. Failures are caught
                 # inside the helper; the stream is already complete.
-                await _persist_chat_history(chat_id, request.user_id, chat_session)
+                await _persist_chat_history(chat_id, body.user_id, chat_session)
 
             except asyncio.CancelledError:
                 # Client disconnected mid-stream. Consume remaining chunks
@@ -1396,9 +1877,10 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             getattr(request, "chat_id", None),
             exc,
         )
-        raise HTTPException(
+        raise APIException(
             status_code=500,
             detail="AI service error",
+            hint="An unexpected server error occurred while initialising streaming chat. Please verify your connection and retry.",
         ) from exc
     finally:
         telemetry.registry.record_request(
@@ -1416,7 +1898,7 @@ def _strip_system_context(text: str) -> str:
     return text
 
 
-async def _persist_chat_history(chat_id: str, user_id: Optional[str], chat_session) -> None:
+async def _persist_chat_history(chat_id: str, user_id: str | None, chat_session: Any) -> None:
     """Persist chat history and user-chat mapping."""
     try:
         if chat_session and hasattr(chat_session, "history") and chat_session.history:
@@ -1437,7 +1919,7 @@ async def _persist_chat_history(chat_id: str, user_id: Optional[str], chat_sessi
 
 
 @app.get("/user/{user_id}/chats")
-async def get_user_chats(user_id: str):
+async def get_user_chats(user_id: str) -> dict[str, Any]:
     """List all chat IDs for a user."""
     try:
         chat_ids = await session_store.get_user_chats(user_id)
@@ -1456,23 +1938,29 @@ async def get_user_chats(user_id: str):
                     title = msg.get("text", "")[:80]
                 snippet = msg.get("text", "")[:120]
             created_at = await session_store.get_chat_created_at(cid)
-            chats.append({
-                "chat_id": cid,
-                "title": title or f"Chat {cid[:8]}",
-                "snippet": snippet,
-                "message_count": len(history),
-                "created_at": created_at,
-            })
+            chats.append(
+                {
+                    "chat_id": cid,
+                    "title": title or f"Chat {cid[:8]}",
+                    "snippet": snippet,
+                    "message_count": len(history),
+                    "created_at": created_at,
+                }
+            )
         # Most recent first
-        chats.sort(key=lambda c: c["created_at"] or 0, reverse=True)
+        chats.sort(key=lambda c: float(str(c["created_at"] or 0)), reverse=True)
         return {"chats": chats}
     except Exception as e:
         logger.error("Error listing user chats", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error") from e
+        raise APIException(
+            status_code=500,
+            detail="Internal server error",
+            hint="Failed to load user chat sessions. Verify user_id format and retry.",
+        ) from e
 
 
 @app.get("/chat/{chat_id}/history")
-async def get_chat_history(chat_id: str):
+async def get_chat_history(chat_id: str) -> list[dict[str, str]]:
     """Get the message history for a specific chat."""
     try:
         history = await session_store.load_history(chat_id)
@@ -1484,11 +1972,15 @@ async def get_chat_history(chat_id: str):
         return history
     except Exception as e:
         logger.error("Error loading chat history", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error") from e
+        raise APIException(
+            status_code=500,
+            detail="Internal server error",
+            hint="Failed to retrieve chat history. Verify chat_id and retry.",
+        ) from e
 
 
 @app.delete("/chat/{chat_id}")
-async def delete_chat(chat_id: str, user_id: Optional[str] = None) -> dict[str, str]:
+async def delete_chat(chat_id: str, user_id: str | None = None) -> dict[str, str]:
     try:
         existed = chat_id in active_chats
         active_chats.pop(chat_id, None)
@@ -1506,7 +1998,31 @@ async def delete_chat(chat_id: str, user_id: Optional[str] = None) -> dict[str, 
         return {"message": "Chat session not found"}
     except Exception as e:
         logger.error("Error deleting chat", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error") from e
+        raise APIException(
+            status_code=500,
+            detail="Internal server error",
+            hint="Failed to delete chat session. Please retry.",
+        ) from e
+
+
+@app.post("/evidence/verify", response_model=EvidenceVerificationResult)
+async def verify_evidence_endpoint(body: EvidenceVerifyRequest) -> EvidenceVerificationResult:
+    """Run the evidence verification agent on a generated answer.
+
+    Extracts any citation block, parses Quran/Hadith references, links them to
+    claims, and returns a structured audit of support strength.
+    """
+    try:
+        cleaned_text, citation_extraction = extract_citations(body.text)
+        hadith_refs = annotate_hadith(cleaned_text)
+        return verify_evidence_claims(cleaned_text, citation_extraction, hadith_refs)
+    except Exception as exc:
+        logger.error("Evidence verification endpoint failed: %s", exc)
+        raise APIException(
+            status_code=500,
+            detail="Evidence verification failed.",
+            hint="The evidence verification agent could not process the supplied text. Verify the text is well-formed and retry.",
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1544,9 +2060,10 @@ async def submit_feedback(request: Request, body: FeedbackRequest) -> dict[str, 
     for the same (chat_id, message_id) overwrites the earlier record.
     """
     if not rate_limiter.is_allowed(_client_ip(request)):
-        raise HTTPException(
+        raise APIException(
             status_code=429,
             detail="Too many feedback submissions. Please wait before trying again.",
+            hint="Feedback submissions are rate-limited to 20 per minute per IP. Please wait up to 60 seconds before submitting again.",
         )
 
     snapshot = answer_snapshots.get((body.chat_id, body.message_id))
@@ -1554,11 +2071,15 @@ async def submit_feedback(request: Request, body: FeedbackRequest) -> dict[str, 
     answer_text = snapshot["answer"] if snapshot else body.answer
 
     if snapshot is None and (not prompt_text or not answer_text):
-        raise HTTPException(
+        raise APIException(
             status_code=422,
             detail=(
                 "This answer is no longer in memory. Please supply 'prompt' and "
                 "'answer' in the request body so the feedback has context."
+            ),
+            hint=(
+                "Supply both 'prompt' and 'answer' string fields in the JSON body "
+                "(e.g. {'chat_id': '...', 'message_id': '...', 'rating': 'up', 'prompt': '...', 'answer': '...'})."
             ),
         )
 
@@ -1573,7 +2094,7 @@ async def submit_feedback(request: Request, body: FeedbackRequest) -> dict[str, 
         answer=answer_text,
         model_name=telemetry.GEMINI_MODEL,
         generation_config=GENERATION_CONFIG,
-        created_at=datetime.now(UTC).isoformat(),
+        created_at=datetime.now(timezone.utc).isoformat(),  # noqa: UP017
     )
 
     try:
@@ -1581,7 +2102,11 @@ async def submit_feedback(request: Request, body: FeedbackRequest) -> dict[str, 
         await run_in_threadpool(feedback_store.upsert, record)
     except Exception as exc:
         logger.error("Failed to store feedback: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to store feedback.") from exc
+        raise APIException(
+            status_code=500,
+            detail="Failed to store feedback.",
+            hint="Database error storing feedback record. Please retry in a few moments.",
+        ) from exc
 
     logger.info(
         "Feedback stored: chat_id=%s message_id=%s rating=%s",
@@ -1602,7 +2127,11 @@ async def feedback_stats() -> dict[str, Any]:
         return await run_in_threadpool(feedback_store.stats)
     except Exception as exc:
         logger.error("Failed to fetch feedback stats: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to fetch stats.") from exc
+        raise APIException(
+            status_code=500,
+            detail="Failed to fetch stats.",
+            hint="Database error aggregating feedback metrics. Please retry.",
+        ) from exc
 
 
 @app.get("/feedback/records", dependencies=[Depends(require_admin)])
@@ -1616,20 +2145,33 @@ async def feedback_records(
     Requires the X-Admin-Token header.
     """
     if rating and rating not in ("up", "down"):
-        raise HTTPException(status_code=422, detail="rating must be 'up' or 'down'")
+        raise APIException(
+            status_code=422,
+            detail="rating must be 'up' or 'down'",
+            hint="Set the 'rating' query parameter to either 'up' or 'down' (e.g., ?rating=down).",
+        )
     if category and category not in FEEDBACK_TAXONOMY:
-        raise HTTPException(
+        raise APIException(
             status_code=422,
             detail=f"Unknown category. Valid: {sorted(FEEDBACK_TAXONOMY)}",
+            hint=f"Use one of the allowed taxonomy categories: {', '.join(sorted(FEEDBACK_TAXONOMY))} (e.g., ?category=incorrect_information).",
         )
     if not (1 <= limit <= 500):
-        raise HTTPException(status_code=422, detail="limit must be between 1 and 500")
+        raise APIException(
+            status_code=422,
+            detail="limit must be between 1 and 500",
+            hint="Specify an integer limit between 1 and 500 (e.g., ?limit=50). Default is 50.",
+        )
     try:
         records = await run_in_threadpool(feedback_store.list_records, rating, category, limit)
         return {"records": [r.to_dict() for r in records]}
     except Exception as exc:
         logger.error("Failed to fetch feedback records: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to fetch records.") from exc
+        raise APIException(
+            status_code=500,
+            detail="Failed to fetch records.",
+            hint="Database error retrieving feedback records. Please retry.",
+        ) from exc
 
 
 @app.get("/ping")
@@ -1647,7 +2189,11 @@ async def get_memory(user_id: str) -> dict[str, Any]:
     """
     profile = await memory_store.get_profile(user_id)
     if profile is None:
-        raise HTTPException(status_code=404, detail="Memory not found")
+        raise APIException(
+            status_code=404,
+            detail="Memory not found",
+            hint="No user profile found for the provided user_id. Memory is created automatically when chatting with user_id provided.",
+        )
     return profile.model_dump()
 
 
@@ -1677,6 +2223,7 @@ def get_health_status(deep: bool = False) -> tuple[dict, int]:
         "version": app.version,
         "checks": checks,
         "failing_check": "gemini_api_key_configured",
+        "hint": "Configure the GEMINI_API_KEY environment variable with a valid Google Gemini API key.",
     }, 503
 
 
@@ -1688,7 +2235,16 @@ async def health(deep: bool = False) -> JSONResponse:
 
 @app.get("/cache/stats")
 async def cache_stats() -> dict[str, Any]:
-    return semantic_cache.get_stats()
+    exact_cache = get_chat_exact_cache()
+    return {
+        "semantic": semantic_cache.get_stats(),
+        "exact": exact_cache.get_stats(),
+        "combined": {
+            "total_hits": semantic_cache.hits + exact_cache.hits,
+            "total_misses": semantic_cache.misses + exact_cache.misses,
+            "total_tokens_saved": semantic_cache.tokens_saved + exact_cache.tokens_saved,
+        },
+    }
 
 
 @app.get("/metrics")
@@ -1702,17 +2258,38 @@ async def metrics() -> dict[str, Any]:
     /cache/stats. #9 (auth/rate limiting) can consume the cost/token totals
     below without this endpoint enforcing anything itself.
     """
+    exact_cache = get_chat_exact_cache()
     snapshot = telemetry.registry.snapshot()
     snapshot["semantic_cache"] = semantic_cache.get_stats()
+    snapshot["exact_cache"] = exact_cache.get_stats()
+    snapshot["combined_cache"] = {
+        "total_hits": semantic_cache.hits + exact_cache.hits,
+        "total_misses": semantic_cache.misses + exact_cache.misses,
+        "total_tokens_saved": semantic_cache.tokens_saved + exact_cache.tokens_saved,
+    }
     return snapshot
 
 
 @app.get("/confidence/policy")
 async def confidence_policy() -> dict[str, Any]:
     """Current confidence thresholds and the queue's durability."""
+    calibration = None
+    if _calibration_events:
+        scores = [event["score"] for event in _calibration_events]
+        calibration = {
+            "observations": len(_calibration_events),
+            "mean_score": round(sum(scores) / len(scores), 4),
+            "min_score": round(min(scores), 4),
+            "max_score": round(max(scores), 4),
+            "bands": {
+                band: sum(1 for event in _calibration_events if event["band"] == band)
+                for band in (b.value for b in ConfidenceBand)
+            },
+        }
     return {
         "thresholds": confidence_thresholds(),
         "review_queue": await review_store.stats(),
+        "calibration": calibration,
     }
 
 

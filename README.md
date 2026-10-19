@@ -19,9 +19,10 @@
 
 This service powers the AI assistant inside **Deen Bridge**, a platform for authentic Islamic education built on the **Stellar network** — courses and books are purchased with USDC, and creators are paid directly to their own Stellar wallets. The assistant wraps Google's Gemini model with an Islamic-knowledge system prompt, content safety filters, and per-session conversation history, exposing a simple chat API consumed by the web app.
 
-On the roadmap: further Stellar-aware assistance beyond zakat and purchase Q&A
-(see open issues). Zakat on a wallet's on-chain USDC balance and factual answers
-about the signed-in user's Stellar course/book purchases are already supported.
+Stellar-aware chat supports wallet USDC zakat estimates, factual answers about
+the signed-in user's Stellar purchases, and exact USDC/stroop and
+user-specified percentage calculations. Calculations are informational; the AI
+service never signs or submits a Stellar transaction.
 
 The platform is composed of three services:
 
@@ -41,6 +42,7 @@ The platform is composed of three services:
 - 🧠 **Per-user long-term memory** — user profiles (knowledge level, madhhab, topics studied, remembered facts) extracted from conversations and injected across sessions; privacy controls with GET/DELETE endpoints and `remember` opt-out per request
 - 📋 **Conversation summarization** — compaction API ready for token-budget-triggered eviction; merges and recompresses summaries when history exceeds budget
 - 📖 **Tafsir-grounded ayah explanations** — retrieved from named classical works, never paraphrased from model memory
+- 🕵️ **Hadith Research Agent** — retrieval, isnad chain analysis, rijal (narrator) cross-referencing, grading justification, and variant alignment across ten major collections
 - 📚 **Structured citations** — Quran and Hadith references returned as validated, typed objects on every answer, bounds-checked against the 114-surah index
 - ⚡ **FastAPI** with automatic OpenAPI docs at `/docs`
 
@@ -57,9 +59,16 @@ All chat endpoints require an `X-API-Key` header (see [Authentication & Rate Lim
 | `DELETE` | `/memory/{user_id}` | Completely erase a stored user profile |
 | `GET` | `/ping` | Trivial liveness check (always returns 200) |
 | `GET` | `/health` | Structured health check - status, version and dependency checks. Returns 200 if all checks pass, 503 otherwise |
+| `GET` | `/stellar/info` | Stellar network, USDC issuer, and supported AI features |
+| `POST` | `/stellar/usdc/convert` | Convert USDC to stroops or stroops to USDC |
 | `GET` | `/cache/stats` | Semantic cache metrics (hits, misses, hit rate, etc.) |
 | `POST` | `/tafsir` | Ayah explanation from named tafsir works, with attribution |
+| `POST` | `/tafsir/batch` | Concurrent tafsir lookup for multiple references, with partial results |
 | `GET` | `/tafsir/sources` | Tafsir works available for retrieval, and their languages |
+| `GET` | `/hadith-research/sources` | Hadith collections the research agent can retrieve |
+| `POST` | `/hadith-research/lookup` | Resolve a hadith citation: grading, justification, and variant membership |
+| `POST` | `/hadith-research/chain` | Isnad analysis: narrator reliability and chain continuity |
+| `POST` | `/hadith-research/variants` | Find variant narrations by matn text or by citation |
 | `GET` | `/confidence/policy` | Active confidence thresholds and review-queue depth |
 | `GET` | `/review/pending` | Answers awaiting a scholar's verdict (reviewer token) |
 | `GET` | `/review/reviewed` | Answers that already carry a verdict (reviewer token) |
@@ -68,6 +77,114 @@ All chat endpoints require an `X-API-Key` header (see [Authentication & Rate Lim
 | `POST` | `/feedback` | Rate a specific answer and flag failure categories |
 | `GET` | `/feedback/stats` | Aggregate answer-quality metrics (admin token) |
 | `GET` | `/feedback/records` | Browse flagged records, filterable (admin token) |
+
+## 🔐 Authentication & Rate Limiting
+
+### Authentication
+
+Protected endpoints (including `/chat` and `/chat/stream`) require an
+`X-API-Key` request header whose value matches the server's `SERVICE_API_KEY`.
+Requests with a missing or invalid key are rejected with `401`. For local
+development you can bypass authentication entirely by setting
+`AUTH_DISABLED=true` (never do this in production — `SERVICE_API_KEY` is
+mandatory when `ENVIRONMENT=production`).
+
+### Rate Limiting
+
+The service enforces three independent limits. All of them are **in-process**
+(non-persistent) and therefore reset on restart and are scoped to a single
+instance — a shared Redis backend would be required for multi-instance
+deployments.
+
+| Limit | Applies to | Default | Env vars |
+|-------|-----------|---------|----------|
+| Request rate (slowapi) | `POST /chat`, `POST /chat/stream` | **60 requests / 60 seconds** per client | `CHAT_RATE_LIMIT_MAX` (`60`), `CHAT_RATE_LIMIT_WINDOW_SECONDS` (`60`) |
+| Hourly token quota | `POST /chat` (per turn) | **100 000 tokens / hour** per user | `CHAT_TOKEN_QUOTA_PER_HOUR` (`100000`) |
+| Feedback submissions | `POST /feedback` | **20 requests / 60 seconds** per IP | `FEEDBACK_RATE_LIMIT_MAX` (`20`), `FEEDBACK_RATE_LIMIT_WINDOW` (`60`) |
+
+**How a client is identified for the request-rate limit.** The slowapi limiter
+keys each caller by, in order of preference: the `X-API-Key` header (so limits
+are enforced **per API key** when authenticated), otherwise the first address in
+`X-Forwarded-For` (the app runs behind a proxy on Render), otherwise the direct
+remote address. The hourly token quota is keyed by the request's `user_id` when
+one is supplied, falling back to the same client key.
+
+#### Response headers — no `X-RateLimit-*`
+
+> **Note:** This service does **not** emit `X-RateLimit-Limit`,
+> `X-RateLimit-Remaining`, or `X-RateLimit-Reset` headers. The slowapi limiter
+> is created as `Limiter(key_func=...)` **without** `headers_enabled=True`, so
+> those informational headers are never added. Do not build clients that depend
+> on them.
+
+The only rate-limit header you can rely on is **`Retry-After`** (an integer
+number of seconds), which is set on:
+
+- `429` responses from `/chat` and `/chat/stream` (request-rate limit), and
+- the `429` returned by the `/chat` hourly token-quota check.
+
+The `/feedback` `429` does **not** include a `Retry-After` header; its
+60-second window is described in the JSON `hint` field instead.
+
+#### 429 response shape
+
+All three limits return HTTP `429` with a JSON body containing a `detail`
+message and a human-readable `hint`, for example:
+
+```jsonc
+// POST /chat or /chat/stream — request-rate limit exceeded
+// (also carries a `Retry-After: <seconds>` header)
+{
+  "detail": "Rate limit exceeded: 60 per 1 minute",
+  "hint": "Too many requests sent. Please wait 60 seconds before retrying."
+}
+```
+
+```jsonc
+// POST /chat — hourly token quota exceeded
+// (also carries a `Retry-After: <seconds>` header)
+{
+  "detail": "Token quota exceeded. Please try again later.",
+  "hint": "Hourly token quota limit reached. Please wait N seconds before sending further messages, or reduce message length."
+}
+```
+
+#### Handling `429` with exponential backoff
+
+Honour `Retry-After` when it is present, and fall back to exponential backoff
+(with jitter) otherwise:
+
+```python
+import random
+import time
+
+import requests
+
+API_URL = "http://localhost:8000/chat"
+HEADERS = {"X-API-Key": "your-service-api-key"}
+
+
+def post_chat(payload: dict, max_retries: int = 5) -> requests.Response:
+    """POST to /chat, retrying on 429 with Retry-After + exponential backoff."""
+    for attempt in range(max_retries):
+        response = requests.post(API_URL, json=payload, headers=HEADERS, timeout=60)
+
+        if response.status_code != 429:
+            response.raise_for_status()
+            return response
+
+        # Prefer the server's Retry-After hint; otherwise back off exponentially.
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is not None:
+            delay = float(retry_after)
+        else:
+            delay = 2 ** attempt  # 1s, 2s, 4s, 8s, ...
+
+        delay += random.uniform(0, 1)  # jitter to avoid thundering herd
+        time.sleep(delay)
+
+    raise RuntimeError(f"Still rate-limited after {max_retries} retries")
+```
 
 ## 🚀 Getting Started
 
@@ -170,6 +287,8 @@ services:
 | `FEEDBACK_RATE_LIMIT_WINDOW` | Feedback rate-limit window in seconds | `60` |
 | `QURAN_API_BASE` | Base URL for tafsir/ayah retrieval | `https://api.quran.com/api/v4` |
 | `QURAN_API_TIMEOUT` | Tafsir request timeout in seconds | `15` |
+| `TAFSIR_API_BASE` | Base URL for works quran.com no longer carries (Tafsir al-Jalalayn), served from the free spa5k/tafsir_api CDN collection | `https://cdn.jsdelivr.net/gh/spa5k/tafsir_api@main/tafsir` |
+| `TAFSIR_API_TIMEOUT` | Tafsir API (CDN) request timeout in seconds | `15` |
 | `TAFSIR_MAX_AYAT` | Maximum ayat per `/tafsir` request | `10` |
 | `TAFSIR_CHAT_EXCERPT_CHARS` | Tafsir characters per work handed to the model in `/chat` | `2500` |
 | `TAFSIR_CHAT_TIMEOUT` | Wall-clock budget for tafsir retrieval inside a `/chat` turn | `20` (seconds) |
@@ -490,6 +609,14 @@ curl -X POST http://localhost:8000/tafsir \
   with it (set `allow_language_fallback: false` to omit it instead).
 - **Degradation**: a work with no entry for the ayah appears under `unavailable`
   with a reason; the rest of the response is unaffected.
+- **Works**: `GET /tafsir/sources` lists every retrievable work. In addition to
+  the Quran.com-hosted works, **Tafsir al-Jalalayn** (`jalalayn`, English and
+  Arabic) is served from the free [`spa5k/tafsir_api`](https://github.com/spa5k/tafsir_api)
+  collection on the jsDelivr CDN (mirroring the altafsir.com text), because
+  Quran.com's API no longer carries it. Jalalayn has near-complete ayah
+  coverage, but like every source its gaps are handled by the same fallback:
+  an ayah the source does not serve is reported under `unavailable` with a
+  reason instead of failing the request.
 - **Latency**: ayat, and the works within an ayah, are fetched concurrently, and
   retrieval inside `/chat` is bounded by `TAFSIR_CHAT_TIMEOUT` — a slow upstream
   costs the turn its grounding, never its response.
@@ -498,11 +625,91 @@ curl -X POST http://localhost:8000/tafsir \
   response cache, sharing its TTL and eviction settings rather than adding a
   second cache system.
 
+### Batch tafsir lookup
+
+`POST /tafsir/batch` retrieves tafsir for multiple references in one request.
+References are fetched concurrently and each result is keyed by the exact
+reference submitted. Invalid references or individual retrieval failures do not
+discard successful results; they appear under `errors` instead.
+
+```bash
+curl -X POST http://localhost:8000/tafsir/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"references": ["2:255", "103:1-3", "112:1-4"], "tafsirs": ["ibn-kathir"], "language": "en"}'
+```
+
+```jsonc
+{
+  "results": {
+    "2:255": {"ayat": [], "language": "en"},
+    "103:1-3": {"ayat": [], "language": "en"},
+    "112:1-4": {"ayat": [], "language": "en"}
+  },
+  "errors": {}
+}
+```
+
+The request accepts at most 10 references and 20 total ayat. Exceeding either
+limit rejects the batch before retrieval begins.
+
 In `/chat`, a verse-explanation question ("what does Surah al-'Asr mean?",
 "explain 2:255") is detected offline and answered from the same retrieved
 passages, with the model instructed to attribute each claim to a named mufassir
 and to surface — not flatten — points where the mufassirun differ. The response
 carries a `tafsir` block naming the works whose text actually backed the answer.
+
+### Hadith research agent
+
+`/hadith-research/*` is a specialized, fully-offline agent for studying and
+authenticating hadith narrations:
+
+```bash
+curl -X POST http://localhost:8000/hadith-research/lookup \
+  -H 'Content-Type: application/json' \
+  -d '{"reference": "Sahih al-Bukhari 1"}'
+```
+
+```jsonc
+{
+  "collection": "bukhari",
+  "collection_name": "Sahih al-Bukhari",
+  "hadith_number": 1,
+  "grade": "SAHIH",
+  "chain_type": "MARFU",
+  "disputed": false,
+  "grading": {
+    "strength": "SAHIH",
+    "graders": [{"grader": "Scholarly consensus (Bukhari and Muslim)", "raw_grade": "Sahih (ijma')"}],
+    "justification": "Single named grader: …"
+  },
+  "variants": [/* cross-collection references with their own grades */],
+  "citation": "Sahih al-Bukhari, no. 1 (Book 1, Hadith 1)"
+}
+```
+
+- **Retrieval across ten collections** — the two Sahihs, the four Sunan, the
+  Muwatta, al-Nawawi's Forty, the Forty Qudsi, and Shah Waliullah's Forty
+  (`GET /hadith-research/sources` lists them with hadith counts). Citations
+  may be free text ("Sunan Abu Dawud, Book 13, Hadith 27") or explicit
+  `collection` + `number` fields.
+- **Grading justification** — every named grader's raw verdict is preserved
+  and shown; disagreement between graders is surfaced as `disputed`, and the
+  conservative weakest-wins aggregation is stated explicitly. Bukhari, Muslim,
+  al-Nawawi's Forty and the Forty Qudsi carry the scholarly-consensus grade.
+- **Isnad analysis** (`/hadith-research/chain`) — narrator names are matched
+  against a curated offline rijal reference; unknown and weak (da'if/matruk)
+  transmitters are flagged, and the chain's generation order is checked for
+  continuity (a missing link or an implausible order is reported).
+- **Variant alignment** (`/hadith-research/variants`) — a famous narration's
+  cross-collection references are traced and graded, and a free-text matn can
+  be matched against the curated variant map, so the same hadith cited under
+  different numbers is reconciled rather than presented as unrelated.
+- **Data**: grading records live in `data/hadith/*.json` (see
+  [`data/hadith/PROVENANCE.md`](data/hadith/PROVENANCE.md)), narrators in
+  `data/rijal/narrators.json`, and the variant map in `data/hadith/variants.json`.
+  Like the rest of the hadith layer, only grading *metadata* is bundled — never
+  translated hadith text — so every result is advisory; confirm against a full
+  reference (e.g. Sunnah.com) and a qualified scholar.
 
 ### Zakat (on-chain, with a live nisab)
 
@@ -562,6 +769,29 @@ figures used.
 validation like any other malformed input, so one can never reach Horizon. If a
 message looks like it contains a secret key, the assistant refuses to use it and
 warns the user to treat it as compromised — without repeating it back.
+
+### Stellar USDC calculations
+
+In chat, users can ask questions such as “How many stroops are in 12.5 USDC?”
+or “What is 3% of 80 USDC?” The first uses Stellar's seven-decimal USDC unit;
+percentage calculations use the rate and amount supplied by the user. A prompt
+such as “80 USDC after 3% fee” returns both the hypothetical fee and remainder.
+These calculations use decimal arithmetic, do not look up an exchange rate, and
+do not initiate a payment or claim to represent Deen Bridge's actual fee.
+
+The conversion is also available directly:
+
+```bash
+curl -sX POST http://localhost:8000/stellar/usdc/convert \
+  -H 'Content-Type: application/json' \
+  -d '{"amount": "12.5", "direction": "usdc_to_stroops"}'
+```
+
+Use `"direction": "stroops_to_usdc"` to convert whole stroops back to USDC.
+Amounts with more than seven decimal places and fractional stroop values are
+rejected rather than silently rounded. The AI service only provides the
+calculation; Stellar network fees are dynamic and are not estimated by this
+endpoint.
 
 **Purchase history in chat.** A signed-in frontend can pass a short
 `transactions` summary (hash, amount, status, item title, date, optional memo)
@@ -638,15 +868,13 @@ available with `SAFETY_LIVE_TESTS=1 GEMINI_API_KEY=... pytest -q tests/redteam/t
 
 Deployed on [Render](https://render.com) via [`render.yaml`](render.yaml). CI runs lint and syntax checks on every PR (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
-## 🌊 Contributing & Drips Wave
+## Contributing
 
-This repository is hoping to  participates in the  **[Stellar Drips Wave](https://www.drips.network/wave/stellar)** bounty program — contributors earn Points (and real rewards) for resolving this repo's issues during a Wave, with complexity tiers set in the Drips Wave app.
-
-- All pull requests target the **`dev`** branch (`main` is releases only)
+- Pull requests target **`dev`**; eligible changes are squash-merged automatically after CI and review gates pass.
 - CI must pass before review
 - One contributor per issue — comment to claim it first
 
-Read **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full workflow, coding standards, and Wave rules.
+Read **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full workflow and coding standards.
 
 ## 📜 License
 
